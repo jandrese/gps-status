@@ -1,0 +1,554 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+require 5.014;
+use utf8;
+
+use Gtk3 -init;
+use Glib ('TRUE', 'FALSE', 'G_PRIORITY_DEFAULT');
+use Gtk3::Helper;
+use Time::Local;
+
+# If your device shows up in multiple places you can use a glob, the first
+# device found will be used.
+my $gpsdevice = '/dev/ttyACM*';
+
+# These may need to be adjusted based on what your reciever reports, it's not
+# always raw dBm
+my $maxdb = 55;		# Strong Signal
+my $meddb = 45;		# Moderate Signal
+my $lowdb = 40;		# Weak Signal
+
+#############################################################################
+
+my $pi = 3.1415926;
+my $barwidth = 32;	# Size of dB bars
+my %curr;
+my %updated;
+my %values;
+my $barwindow;
+my $compassarea;
+
+my @sat_update;
+my @sat_azi;
+my @sat_elev;
+my @sat_db;
+my @sat_lock;
+
+my @fields =
+(
+	"Lock",
+	"FixType",
+	"Time",
+	"Latitude",
+	"Longitude",
+	"Altitude",
+	"PosDOP",
+	"HorizDOP",
+	"VertDOP",
+#	"NumSats",
+	"Speed",
+	"Direction"
+);
+
+#####################################################################
+sub addfield($$$)
+{
+	my $label_string = shift;
+	my $label_layout = shift;
+	my $value_layout = shift;
+
+	my $label = Gtk3::Label->new($label_string);
+	$label->set_xalign(0.0);
+	$label_layout->pack_start($label, FALSE, FALSE, 4);
+	my $value = Gtk3::Label->new("N/A");
+	$value->set_xalign(0.0);
+	$value_layout->pack_start($value, FALSE, FALSE, 4);
+
+	return $value;
+}
+#####################################################################
+sub settime($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	my @now = gmtime(time);
+
+	$val =~ /(\d\d)(\d\d)(\d\d)\.(\d\d)/;
+
+	$now[0] = $3;
+	$now[1] = $2;
+	$now[2] = $1;
+
+	my $secs = timegm(@now);
+
+	my $date = scalar localtime $secs;
+
+	$curr{$label} = $date;
+	$updated{$label} = time;
+}
+#####################################################################
+sub setlocation($$$)
+{
+	my $position = shift;
+	my $direction = shift;
+	my $label = shift;
+
+	return if ( ! $position || ! $direction );
+
+	$position =~ /(\d*)(\d{2})\.(\d+)/;
+
+	$curr{$label} = $1 . '.' . $2 . $3 . '° ' . $direction;
+	$updated{$label} = time;
+}
+#####################################################################
+sub setalt($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	$curr{$label} = "$val m";
+	$updated{$label} = time;
+}
+#####################################################################
+sub setquality($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	$curr{$label} = $val;
+	$updated{$label} = time;
+}
+#####################################################################
+sub setfix($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	$curr{$label} = "No Lock";
+	if ( $val == 2 )
+	{
+		$curr{$label} = "2D Lock";
+	} elsif ( $val == 3 )
+	{
+		$curr{$label} = "3D Lock";
+	}
+
+	$updated{$label} = time;
+}
+#####################################################################
+sub setnumsats($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	$curr{$label} = $val;
+	$updated{$label} = time;
+}
+#####################################################################
+sub setdop($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val );
+
+	$curr{$label} = $val;
+	$updated{$label} = time;
+}
+#####################################################################
+sub setspeed($$$)
+{
+	my $val = shift;
+	my $type = shift;
+	my $label = shift;
+
+	return if ( ! $val || ! $type );
+	return if ( $type ne 'K' );
+
+	$curr{$label} = $val . " kph";
+	$updated{$label} = time;
+}
+
+#####################################################################
+my @fixtypes = 
+(
+	'invalid',
+	'GPS fix (SPS)',
+	'DGPS fix',
+	'PPS fix',
+	'Real Time Kinematic',
+	'Float RTK',
+	'Dead Reckoning',
+	'Manual Input',
+	'Simulation Mode'
+);
+sub setfixtype($$)
+{
+	my $val = shift;
+	my $label = shift;
+
+	return if ( ! $val || $val eq '' );
+
+	$curr{$label} = $fixtypes[$val];
+	$updated{$label} = time;
+}
+
+#####################################################################
+sub setdirection($$$)
+{
+	my $val = shift;
+	my $type = shift;
+	my $label = shift;
+
+	return if ( ! $val || ! $type );
+	return if ( $type ne 'T' );
+
+	$curr{$label} = $val . '°';
+	$updated{$label} = time;
+}
+
+#####################################################################
+sub setsat($$$$)
+{
+	my $num = shift;
+	my $elev = shift;
+	my $azi = shift;
+	my $snr = shift;
+
+	return if  ( ! defined $num || $num eq '' );
+
+	$sat_update[$num] = time;
+	$sat_azi[$num] = $azi;
+	$sat_elev[$num] = $elev;
+	$sat_db[$num] = $snr;
+}
+
+#####################################################################
+sub consume_nmea
+{
+	my $fh = shift;
+
+	my $buf;
+	if ( not sysread $fh, $buf, 8192 )
+	{
+		Gtk3->main_quit();
+	}
+
+	while ( $buf =~ /\$GP(...),(.*?)\*([0-9A-Fa-f]{2})/g )
+	{
+		my $code = $1;
+		my @data = split(',', $2);
+		my $crc = $3;
+
+		if ( $code eq 'GGA' )
+		{
+			settime($data[0], 'Time');
+			setlocation($data[1], $data[2], 'Latitude');
+			setlocation($data[3], $data[4], 'Longitude');
+			setfixtype($data[5], 'FixType');
+			#setquality($data[5], 'Lock');
+			#setnumsats($data[6], 'NumSats');
+			setdop($data[7], 'HorizDOP');
+			setalt($data[8], 'Altitude');
+		}
+		elsif ( $code eq 'GSA' )
+		{
+			setfix($data[1], 'Lock');
+			@sat_lock = ();
+
+			for ( my $lock = 2; $lock < 14; $lock++ )
+			{
+				if ( defined $data[$lock] && $data[$lock] ne '' )
+				{
+					$sat_lock[$data[$lock]] = 1; 
+				}
+			}
+
+			setdop($data[14], 'PosDOP');
+			setdop($data[15], 'HorizDOP');
+			setdop($data[16], 'VertDOP');
+		}
+		elsif ( $code eq 'GLL' )
+		{
+			#setlocation($data[1], $data[2], 'Latitude');
+			#setlocation($data[3], $data[4], 'Longitude');
+		}
+		elsif ( $code eq 'RMC' )
+		{
+			settime($data[0], 'Time');
+			setlocation($data[2], $data[3], 'Latitude');
+			setlocation($data[4], $data[5], 'Longitude');
+		}
+		elsif ( $code eq 'VTG' )
+		{
+			setdirection($data[0], $data[1], 'Direction');
+			setspeed($data[6], $data[7], 'Speed');
+		}
+		elsif ( $code eq 'GSV' )
+		{
+			setnumsats($data[2], 'NumSats');
+			setsat($data[3], $data[4], $data[5], $data[6]);
+			setsat($data[7], $data[8], $data[9], $data[10]);
+			setsat($data[11], $data[12], $data[13], $data[14]);
+			setsat($data[15], $data[16], $data[17], $data[18]);
+		}
+		else
+		{
+		}
+	}
+
+	return TRUE;
+}
+#####################################################################
+sub updategui
+{
+	my $thresh = time - 3;
+
+	foreach my $label ( @fields ) 
+	{
+		if ( $updated{$label} > $thresh )
+		{
+			$values{$label}->set_text($curr{$label});
+		}
+		else
+		{
+			$values{$label}->set_text("N/A");
+		}
+	}
+	$barwindow->queue_draw();
+	$compassarea->queue_draw();
+	return TRUE;
+}
+
+#####################################################################
+sub draw_sat_bar($$$)
+{
+	my $cr = shift;
+	my $prn = shift;
+	my $offset = shift;
+
+	$cr->select_font_face("DejaVu Sans", 'normal', 'normal');
+	$cr->set_font_size("12");
+	$cr->move_to($offset * $barwidth + 6, 10);
+	$cr->set_source_rgb(0, 0, 0);
+	$cr->show_text($prn);
+
+	$cr->move_to($offset * $barwidth, 30);
+	$cr->show_text($sat_azi[$prn]);
+	$cr->move_to($offset * $barwidth + 6, 50);
+	$cr->show_text($sat_elev[$prn]);
+
+	return if ( ! defined $sat_db[$prn] || $sat_db[$prn] eq '' );
+
+	my $height = int(140.0 * ($sat_db[$prn] / $maxdb) );
+
+	$cr->move_to($offset * $barwidth + 6, 200 - $height );
+	if ( defined $sat_lock[$prn] && $sat_lock[$prn] == 1 )
+	{
+		$cr->set_source_rgb(0, 0, 255);
+	}
+	$cr->show_text($sat_db[$prn]);
+	
+	if ( $sat_db[$prn] < $lowdb )
+	{
+		$cr->set_source_rgb(255, 0, 0);
+	}
+	elsif ( $sat_db[$prn] < $meddb )
+	{
+		$cr->set_source_rgb(255, 255, 0);
+	}
+	else
+	{
+		$cr->set_source_rgb(0, 255, 0);
+	}
+
+	$cr->rectangle($offset * $barwidth + 2, 200 - $height,
+			$barwidth - 4, $height);
+	$cr->fill();
+	$cr->stroke();
+}
+
+#####################################################################
+sub draw_boxes
+{
+	my $cr = shift;
+
+	$cr->set_source_rgb(255, 255, 255);
+	$cr->rectangle(0, 0, 800, 200);
+	$cr->fill();
+	$cr->stroke();
+
+	my $thresh = time - 3;
+	my $num_drawn = 0;
+
+	for ( my $prn = 0; $prn <= 99; $prn++ )
+	{
+		if ( $sat_update[$prn] > $thresh )
+		{
+			draw_sat_bar($cr, $prn, $num_drawn);
+			$num_drawn++;
+		}
+	}
+
+	return;
+}
+#####################################################################
+sub draw_compass
+{
+	my $cr = shift;
+
+	$cr->set_source_rgb(255, 255, 255);
+	$cr->translate(150, 150);
+	$cr->arc(0, 0, 150, 0, 2*$pi);
+	$cr->fill;
+	$cr->stroke;
+
+	$cr->set_source_rgb(0.5, 0.5, 0.5);
+	for ( my $angle = 0; $angle < 360; $angle += 15 )
+	{
+		$cr->save;
+		$cr->move_to(0, 0);
+		$cr->rotate($angle / 180 * $pi);
+		$cr->line_to(0, -150);
+		$cr->stroke;
+		$cr->restore;
+	}
+
+	$cr->save;
+	$cr->set_source_rgb(255, 255, 255);
+	$cr->arc(0, 0, 140, 0, 2*$pi);
+	$cr->fill;
+	$cr->restore;
+
+	$cr->save;
+	$cr->select_font_face('sans-serif', 'normal', 'bold');
+	$cr->set_font_size(16);
+	$cr->set_source_rgb(0, 0, 0);
+	$cr->move_to(-6, -128);
+	$cr->show_text('N');
+	$cr->move_to(128, 6);
+	$cr->show_text('E');
+	$cr->move_to(-6, 138);
+	$cr->show_text('S');
+	$cr->move_to(-138, 6);
+	$cr->show_text('W');
+	$cr->restore;
+
+	$cr->set_source_rgb(0, 0, 0);
+	$cr->scale(15, 15);
+
+	my $speed = 0;
+	if ( $updated{'Speed'} >= ( time - 3 ) )
+	{
+		$curr{'Speed'} =~ /^([0-9.]*)/;
+		$speed = $1;
+	}
+	
+	if ( $updated{'Direction'} < (time - 3) || $speed < 1 )
+	{
+		$cr->move_to(-2, 0);
+		$cr->line_to(-8, -6);
+		$cr->line_to(-6, -8);
+		$cr->line_to(0, -2);
+		$cr->line_to(6, -8);
+		$cr->line_to(8, -6);
+		$cr->line_to(2, 0);
+		$cr->line_to(8, 6);
+		$cr->line_to(6, 8);
+		$cr->line_to(0, 2);
+		$cr->line_to(-6, 8);
+		$cr->line_to(-8, 6);
+		$cr->close_path;
+	}
+	else
+	{
+		$curr{'Direction'} =~ /^([0-9.]*)/;
+		$cr->rotate($1 / 180.0 * $pi);
+		$cr->move_to(-5, -3);
+		$cr->line_to(0, -8);
+		$cr->line_to(5, -3);
+		$cr->line_to(2, -3);
+		$cr->line_to(2, 8);
+		$cr->line_to(-2, 8);
+		$cr->line_to(-2, -3);
+		$cr->close_path;
+	}
+
+	$cr->fill;
+	$cr->stroke;
+
+	return;
+}
+
+#####################################################################
+
+my $win = Gtk3::Window->new('toplevel');
+$win->set_title("GPS Status");
+$win->signal_connect('delete_event' => sub {Gtk3->main_quit()});
+
+my $vert_layout = Gtk3::VBox->new(FALSE, 4);
+my $label_layout = Gtk3::VBox->new(FALSE, 4);
+my $value_layout = Gtk3::VBox->new(FALSE, 4);
+my $main_layout = Gtk3::HBox->new(FALSE, 4);
+
+foreach my $field ( @fields )
+{
+	$values{$field} = addfield($field, $label_layout, $value_layout);
+}
+
+my @nmeacandidates = glob $gpsdevice;
+open(my $nmeadev, "<", $nmeacandidates[0]) or die "Unable to open NMEA device $nmeacandidates[0]: $!\n";
+
+my $feed = Gtk3::Helper->add_watch($nmeadev->fileno, 'in', 
+		sub { consume_nmea($nmeadev, \%values) } );
+
+$main_layout->pack_start($label_layout, TRUE, TRUE, 4);
+$main_layout->pack_start($value_layout, TRUE, TRUE, 4);
+
+$compassarea = Gtk3::Layout->new();
+$compassarea->set_size_request(300, 300);
+$compassarea->signal_connect( 'draw' => sub { draw_compass($_[1]) });
+$main_layout->pack_start($compassarea, FALSE, FALSE, 4);
+
+$vert_layout->pack_start($main_layout, FALSE, FALSE, 4);
+
+$barwindow = Gtk3::Layout->new();
+$barwindow->set_size_request(600, 200);
+$barwindow->signal_connect( 'draw' => sub { draw_boxes($_[1]) });
+
+$vert_layout->pack_start($barwindow, FALSE, FALSE, 4);
+
+$win->add($vert_layout);
+$win->show_all;
+
+foreach my $field ( @fields ) 
+{
+	$updated{$field} = 0;
+	$curr{$field} = "N/A";
+}
+
+for ( my $prn = 0; $prn <= 99; $prn++ )
+{
+	$sat_update[$prn] = 0;
+}
+
+my $icon = Gtk3::Gdk::Pixbuf->new_from_file("compass.png");
+$win->set_icon($icon);
+
+Glib::Timeout->add(1000, \&updategui, undef, G_PRIORITY_DEFAULT);
+
+Gtk3->main;
+
