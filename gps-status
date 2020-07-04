@@ -16,9 +16,9 @@ my $gpsdevice = '/dev/ttyACM*';
 
 # These may need to be adjusted based on what your reciever reports, it's not
 # always raw dBm
-my $maxdb = 55;		# Strong Signal
-my $meddb = 45;		# Moderate Signal
-my $lowdb = 40;		# Weak Signal
+my $maxdb = 46;		# Strong Signal
+my $meddb = 36;		# Moderate Signal
+my $lowdb = 26;		# Weak Signal
 
 #############################################################################
 
